@@ -1,0 +1,26 @@
+services:
+  humidificacao:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      PLC_IP: ${PLC_IP:-10.0.0.60}
+      POLL_SECONDS: ${POLL_SECONDS:-15}
+      PLC_TIMEZONE: ${PLC_TIMEZONE:-Europe/Lisbon}
+      SCHEDULE_TIMEZONE: ${SCHEDULE_TIMEZONE:-Europe/Lisbon}
+      SPOOL_PATH: /data/outbox.sqlite3
+    volumes:
+      - hum_data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  hum_data:
