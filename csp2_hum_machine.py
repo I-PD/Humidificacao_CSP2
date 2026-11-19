@@ -315,6 +315,79 @@ def send_one(connection, payload: dict) -> int | None:
             return row[0] if row else None
 
 
+def load_import(path: Path) -> list[dict]:
+    """Valida todo o preview antes de abrir uma ligação à BD."""
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("O JSON deve conter uma lista não vazia de passagens.")
+    result = []
+    seen = set()
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict) or not set(INSERT_COLUMNS).issubset(row):
+            raise ValueError(f"Linha {index}: faltam campos da passagem.")
+        if any(row.get(c) is not None for c in ("record_id", "created_at", "hum_entrada", "hum_saida")):
+            raise ValueError(f"Linha {index}: importar apenas o preview, com IDs/datas/humidades a null.")
+        payload = database_payload(row)
+        for field in ("inicio", "fim"):
+            value = payload[field]
+            if value is None and field == "fim":
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"Linha {index}: {field} deve ser um timestamp com fuso.")
+            stamp = datetime.fromisoformat(value)
+            if stamp.utcoffset() is None:
+                raise ValueError(f"Linha {index}: {field} sem fuso horário.")
+            payload[field] = stamp.astimezone(timezone.utc).isoformat()
+        for field in ("operation_id", "num_inj", "vel_tpt"):
+            value = payload[field]
+            if value is None and field != "operation_id":
+                continue
+            if type(value) is not int or not 0 <= value <= 65535:
+                raise ValueError(f"Linha {index}: {field} deve ser inteiro entre 0 e 65535.")
+        if not isinstance(payload["programa"], str):
+            raise ValueError(f"Linha {index}: programa deve ser texto.")
+        water = payload["qtd_agua"]
+        if water is not None:
+            if type(water) not in (int, float) or not math.isfinite(water) or abs(water) >= 10000000000:
+                raise ValueError(f"Linha {index}: quantidade de água inválida.")
+            payload["qtd_agua"] = round(water, 2)
+            if abs(payload["qtd_agua"]) >= 10000000000:
+                raise ValueError(f"Linha {index}: água excede NUMERIC(12,2).")
+        key = passage_key(payload)
+        if key in seen:
+            raise ValueError(f"Linha {index}: passagem duplicada no JSON: {key}.")
+        seen.add(key)
+        result.append(payload)
+    return sorted(result, key=lambda row: (row["inicio"], row["operation_id"]))
+
+
+def import_rows(connection, rows: list[dict]) -> int:
+    """Importação atómica; um erro reverte todo o lote. Não inicia a recolha."""
+    changed = 0
+    with connection:
+        with connection.cursor() as cursor:
+            for payload in rows:
+                cursor.execute(UPSERT_SQL, payload)
+                if cursor.fetchone() is not None:
+                    changed += 1
+    return changed
+
+
+def database_summary(connection) -> dict:
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SET TRANSACTION READ ONLY")
+            cursor.execute("SELECT count(*), min(inicio), max(inicio), "
+                           "count(DISTINCT operation_id), "
+                           "count(hum_entrada), count(hum_saida) "
+                           "FROM humidificacao_csp2.operacoes")
+            count, first, last, operations, humidity_in, humidity_out = cursor.fetchone()
+    return dict(passagens=count, inicio_mais_antigo=first.isoformat() if first else None,
+                inicio_mais_recente=last.isoformat() if last else None,
+                operacoes_distintas=operations, hum_entrada_preenchidas=humidity_in,
+                hum_saida_preenchidas=humidity_out)
+
+
 def database_worker(outbox: Outbox, config: dict, stop: threading.Event, psycopg2):
     connection = None
     backoff = 5.0
@@ -471,9 +544,12 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path,
                         default=Path(__file__).with_name(".env"))
     parser.add_argument("--plc-ip", help="IPv4 completo do PLC; alternativa: PLC_IP")
-    parser.add_argument("--write-db", action="store_true", help="Ativa fila e envio PostgreSQL")
-    parser.add_argument("--print-schema", action="store_true", help="Imprime SQL e termina")
-    parser.add_argument("--init-db", action="store_true", help="Cria schema/tabela na BD configurada e termina")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--write-db", action="store_true", help="Ativa fila e envio PostgreSQL")
+    mode.add_argument("--print-schema", action="store_true", help="Imprime SQL e termina")
+    mode.add_argument("--init-db", action="store_true", help="Cria schema/tabela na BD configurada e termina")
+    mode.add_argument("--import-json", type=Path, help="Importa o preview numa transação e termina, sem ler PLC")
+    mode.add_argument("--check-db", action="store_true", help="Mostra resumo da BD e termina, sem ler PLC")
     parser.add_argument("--ignore-schedule", action="store_true", help="Permite teste manual fora do horário")
     args = parser.parse_args()
     if args.print_schema:
@@ -486,12 +562,24 @@ def main() -> int:
         if args.env_file.exists():
             from dotenv import load_dotenv
             load_dotenv(args.env_file, override=False)
-        if args.init_db:
+        if args.init_db or args.import_json or args.check_db:
+            rows = load_import(args.import_json) if args.import_json else None
             import psycopg2
-            with psycopg2.connect(**database_config()) as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(SCHEMA_SQL)
-            LOG.info("Schema/tabela preparados na base configurada.")
+            conn = psycopg2.connect(**database_config())
+            try:
+                if args.init_db:
+                    with conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute(SCHEMA_SQL)
+                    LOG.info("Schema/tabela preparados na base configurada.")
+                elif args.import_json:
+                    changed = import_rows(conn, rows)
+                    LOG.info("Importação concluída: passagens=%s; gravações=%s; inalteradas=%s.",
+                             len(rows), changed, len(rows) - changed)
+                else:
+                    print(json.dumps(database_summary(conn), ensure_ascii=False, indent=2))
+            finally:
+                conn.close()
             return 0
         import fins
         import fins.tcp

@@ -8,3 +8,4 @@ migrations/
 exemplos/
 tmp*/
 test-state-*/
+/import/

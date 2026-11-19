@@ -122,6 +122,12 @@ Referências:
 
 ## Arranque
 
+O guia [DEPLOYMENT.md](DEPLOYMENT.md) descreve a publicação no GitHub, criação
+do contentor parado no servidor, importação inicial e arranque da recolha.
+`--import-json` importa o preview numa única transação e termina, sem consultar
+o PLC nem iniciar a recolha. É repetível sem duplicar passagens e preserva as
+humidades manuais existentes. `--check-db` mostra um resumo só de leitura.
+
 O `schema.sql` é a única fonte do SQL de criação e está incluído na imagem.
 O `.env` com as credenciais reais é passado ao contentor apenas em execução.
 Opções de configuração adicionais estão em `.env.example`.

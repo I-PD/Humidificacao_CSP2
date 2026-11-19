@@ -1,4 +1,5 @@
 import struct
+import json
 import threading
 import unittest
 import uuid
@@ -35,6 +36,43 @@ def block(start='261112125809', end='261112125423', operation=228, water=0.0, pr
 
 
 class ServiceTests(unittest.TestCase):
+    def test_import_preview_uses_only_plc_fields_and_sorts_rows(self):
+        first = service.decode_snapshot(block(), ZONE)
+        second = service.decode_snapshot(block(start='261112130100'), ZONE)
+        with test_folder() as folder:
+            path = folder / 'preview.json'
+            path.write_text(json.dumps([dict(second, record_id=None, created_at=None,
+                                             hum_entrada=None, hum_saida=None), first]), encoding='utf-8')
+            rows = service.load_import(path)
+        self.assertEqual(rows, [first, second])
+        self.assertEqual(set(rows[0]), set(service.INSERT_COLUMNS))
+
+    def test_import_rejects_duplicate_passages_and_manual_values(self):
+        row = service.decode_snapshot(block(), ZONE)
+        with test_folder() as folder:
+            path = folder / 'preview.json'
+            for payload in ([row, row], [dict(row, hum_entrada=12.3)],
+                            [dict(row, record_id=1)], [dict(row, inicio='2026-11-12T12:58:09')],
+                            [dict(row, qtd_agua=float('nan'))], [dict(row, operation_id=True)]):
+                with self.subTest(payload=payload):
+                    path.write_text(json.dumps(payload), encoding='utf-8')
+                    with self.assertRaises(ValueError):
+                        service.load_import(path)
+
+    def test_import_commits_one_transaction_and_counts_unchanged_rows(self):
+        connection = Mock()
+        connection.__enter__ = Mock(return_value=connection)
+        connection.__exit__ = Mock(return_value=False)
+        cursor = Mock()
+        cursor.__enter__ = Mock(return_value=cursor)
+        cursor.__exit__ = Mock(return_value=False)
+        connection.cursor.return_value = cursor
+        cursor.fetchone.side_effect = [(1,), None]
+        rows = [service.decode_snapshot(block(), ZONE), service.decode_snapshot(block(start='261112130100'), ZONE)]
+        self.assertEqual(service.import_rows(connection, rows), 1)
+        connection.__enter__.assert_called_once()
+        connection.__exit__.assert_called_once_with(None, None, None)
+
     def test_water_has_two_decimal_places_before_deduplication(self):
         a = service.decode_snapshot(block(water=0.801), ZONE)
         b = service.decode_snapshot(block(water=0.804), ZONE)
